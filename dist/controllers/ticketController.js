@@ -49,7 +49,10 @@ export const getTickets = async (req, res) => {
         const where = {};
         // Role-based visibility enforcement
         if (user?.role === 'EMPLOYEE') {
-            where.requesterId = user.id;
+            where.OR = [
+                { requesterId: user.id },
+                ...(user.departmentId ? [{ departmentId: user.departmentId }] : []),
+            ];
         }
         else if (user?.role === 'TECHNICIAN') {
             where.departmentId = user.departmentId || '__no_department__';
@@ -63,8 +66,8 @@ export const getTickets = async (req, res) => {
                 ];
             }
         }
-        else if (user?.role === 'DEPT_MANAGER' && req.query.deptOnly === 'true' && user.departmentId) {
-            where.departmentId = user.departmentId;
+        else if (user?.role === 'DEPT_MANAGER') {
+            where.departmentId = user.departmentId || '__no_department__';
         }
         if (status && status !== 'ALL') {
             where.status = status;
@@ -72,7 +75,11 @@ export const getTickets = async (req, res) => {
         if (priority && priority !== 'ALL') {
             where.priority = priority;
         }
-        if (departmentId && departmentId !== 'ALL' && user?.role !== 'TECHNICIAN') {
+        if (departmentId &&
+            departmentId !== 'ALL' &&
+            user?.role !== 'TECHNICIAN' &&
+            user?.role !== 'DEPT_MANAGER' &&
+            user?.role !== 'EMPLOYEE') {
             where.departmentId = departmentId;
         }
         if (assignedTechnicianId && user?.role !== 'TECHNICIAN') {
@@ -175,11 +182,16 @@ export const getTicketDetails = async (req, res) => {
         if (!ticket) {
             return res.status(404).json({ error: 'Ticket not found' });
         }
-        // Role security check: employees can only view their own tickets
-        if (req.user?.role === 'EMPLOYEE' && ticket.requesterId !== req.user.id) {
+        // Employees can view their own tickets and tickets routed to their department.
+        if (req.user?.role === 'EMPLOYEE' &&
+            ticket.requesterId !== req.user.id &&
+            ticket.departmentId !== req.user.departmentId) {
             return res.status(403).json({ error: 'Unauthorized to view this ticket' });
         }
         if (req.user?.role === 'TECHNICIAN' && ticket.departmentId !== req.user.departmentId) {
+            return res.status(403).json({ error: 'Ticket belongs to another department' });
+        }
+        if (req.user?.role === 'DEPT_MANAGER' && ticket.departmentId !== req.user.departmentId) {
             return res.status(403).json({ error: 'Ticket belongs to another department' });
         }
         // If employee viewing, filter out internal technician notes
@@ -211,6 +223,19 @@ export const createTicket = async (req, res) => {
         const requesterId = req.user?.id;
         if (!requesterId) {
             return res.status(401).json({ error: 'Authentication required' });
+        }
+        const department = await prisma.department.findUnique({
+            where: { id: departmentId },
+            include: {
+                users: {
+                    where: { status: 'ACTIVE' },
+                    select: { id: true },
+                },
+                manager: { select: { id: true, status: true } },
+            },
+        });
+        if (!department) {
+            return res.status(404).json({ error: 'Department not found' });
         }
         const ticketNumber = await generateTicketNumber();
         const { responseDueAt, resolutionDueAt } = await calculateSLADeadlines(priority);
@@ -261,16 +286,25 @@ export const createTicket = async (req, res) => {
                 ipAddress: req.ip || '127.0.0.1',
             },
         });
-        // Notification to assigned technician
+        // Notify the department team so they can claim and work the unassigned ticket.
+        const recipientIds = new Set(assignedTechnicianId ? [] : department.users.map((member) => member.id));
+        if (department.manager?.status === 'ACTIVE') {
+            recipientIds.add(department.manager.id);
+        }
         if (assignedTechnicianId) {
-            await prisma.notification.create({
-                data: {
-                    userId: assignedTechnicianId,
-                    title: `New Ticket Assigned: ${ticket.ticketNumber}`,
-                    message: `${ticket.subject} (${priority} Priority) at ${location || 'Hotel'}. SLA deadline in effect.`,
+            recipientIds.add(assignedTechnicianId);
+        }
+        if (recipientIds.size > 0) {
+            await prisma.notification.createMany({
+                data: Array.from(recipientIds, (userId) => ({
+                    userId,
+                    title: assignedTechnicianId
+                        ? `New Ticket Assigned: ${ticket.ticketNumber}`
+                        : `New Department Ticket: ${ticket.ticketNumber}`,
+                    message: `${ticket.subject} (${priority} Priority) at ${location || 'Hotel'}.`,
                     type: 'TICKET',
                     linkUrl: `/tickets/${ticket.ticketNumber}`,
-                },
+                })),
             });
         }
         return res.status(201).json(ticket);
@@ -296,9 +330,10 @@ export const updateTicketStatus = async (req, res) => {
             return res.status(400).json({ error: 'Use the assignment response action to accept this ticket' });
         }
         if (['IN_PROGRESS', 'RESOLVED'].includes(status)) {
-            if (req.user?.role !== 'TECHNICIAN' ||
+            if (!['TECHNICIAN', 'EMPLOYEE'].includes(req.user?.role || '') ||
+                existingTicket.departmentId !== req.user?.departmentId ||
                 existingTicket.assignedTechnicianId !== req.user.id) {
-                return res.status(403).json({ error: 'Only the assigned department technician can work on this ticket' });
+                return res.status(403).json({ error: 'Only the assigned department team member can work on this ticket' });
             }
             const validTransition = (status === 'IN_PROGRESS' && existingTicket.status === 'ACCEPTED') ||
                 (status === 'RESOLVED' && existingTicket.status === 'IN_PROGRESS');
@@ -306,8 +341,9 @@ export const updateTicketStatus = async (req, res) => {
                 return res.status(400).json({ error: 'Accept the ticket before starting or resolving work' });
             }
         }
-        else if (req.user?.role === 'TECHNICIAN') {
-            return res.status(403).json({ error: 'Technicians can only start or resolve accepted tickets' });
+        else if (['TECHNICIAN', 'EMPLOYEE'].includes(req.user?.role || '') &&
+            existingTicket.departmentId === req.user?.departmentId) {
+            return res.status(403).json({ error: 'Department team members can only start or resolve accepted tickets' });
         }
         const oldStatus = existingTicket.status;
         const updateData = { status };
@@ -382,8 +418,9 @@ export const handleAssignmentResponse = async (req, res) => {
         if (!ticket) {
             return res.status(404).json({ error: 'Ticket not found' });
         }
-        if (req.user?.role !== 'TECHNICIAN' || ticket.departmentId !== req.user.departmentId) {
-            return res.status(403).json({ error: 'Only a technician in this ticket department can accept it' });
+        if (!['TECHNICIAN', 'EMPLOYEE'].includes(req.user?.role || '') ||
+            ticket.departmentId !== req.user?.departmentId) {
+            return res.status(403).json({ error: 'Only a team member in this ticket department can accept it' });
         }
         if (action === 'ACCEPT') {
             if (!['NEW', 'OPEN', 'ASSIGNED'].includes(ticket.status)) {
